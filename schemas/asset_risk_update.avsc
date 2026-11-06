@@ -1,0 +1,20 @@
+{
+  "type": "record",
+  "name": "AssetRiskUpdate",
+  "namespace": "ai.tracewell.catalog",
+  "doc": "Latest Tracewell risk profile of one AI asset. Key = asset_id; topic is log-compacted.",
+  "fields": [
+    {"name": "asset_id",      "type": "string"},
+    {"name": "asset_name",    "type": ["null", "string"], "default": null},
+    {"name": "category",      "type": ["null", "string"], "default": null},
+    {"name": "risk_score",    "type": ["null", "double"], "default": null},
+    {"name": "capability",    "type": ["null", "double"], "default": null},
+    {"name": "exposure",      "type": ["null", "double"], "default": null},
+    {"name": "governance",    "type": ["null", "double"], "default": null},
+    {"name": "band",          "type": ["null", "string"], "default": null},
+    {"name": "sanctioned",    "type": ["null", "boolean"], "default": null},
+    {"name": "aliases",       "type": ["null", {"type": "array", "items": "string"}], "default": null},
+    {"name": "score_reasons", "type": ["null", {"type": "array", "items": "string"}], "default": null},
+    {"name": "valid_from",    "type": ["null", {"type": "long", "logicalType": "timestamp-millis"}], "default": null}
+  ]
+}

@@ -1,0 +1,13 @@
+asset_id,approved_by,approved_on,notes
+service:chatgpt,security-council,2026-03-01,ChatGPT Enterprise workspace only
+service:microsoft-365-copilot,security-council,2026-02-15,Tenant-wide licence
+agent:github-copilot,security-council,2026-01-20,Business plan with code-referencing filter on
+agent:cursor,security-council,2026-05-10,Privacy mode enforced
+service:ollama,platform-team,2026-04-02,Approved for local models from the approved list
+model:sentence-transformers/all-minilm-l6-v2,ml-platform,2026-02-01,Embedding model for internal search
+model:meta-llama/llama-3.1-8b-instruct,ml-platform,2026-03-12,Local inference only
+pkg:pypi/openai,platform-team,2026-01-10,Official SDK
+pkg:pypi/anthropic,platform-team,2026-01-10,Official SDK
+pkg:npm/@modelcontextprotocol/sdk,platform-team,2026-02-20,Official MCP SDK
+pkg:npm/@modelcontextprotocol/server-filesystem,platform-team,2026-02-20,Read-only mounts only
+mcp:github,security-council,2026-04-18,Fine-grained read-only tokens by default

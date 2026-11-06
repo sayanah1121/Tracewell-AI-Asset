@@ -1,0 +1,347 @@
+# Tracewell local platform.
+# Profiles keep the laptop responsive:
+#   core  = redpanda, redpanda-console, seaweedfs (S3), iceberg-rest, flink
+#   batch = spark, postgres, airflow
+#   bi    = trino, superset
+#   stream = simulator (fleet of laptops producing AI events)
+# Start everything:  ./tracewell.sh up            (or: docker compose --profile core --profile batch --profile bi up -d)
+
+x-s3-env: &s3-env
+  AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
+  AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
+  AWS_REGION: ${AWS_REGION}
+  AWS_DEFAULT_REGION: ${AWS_REGION}
+
+x-catalog-env: &catalog-env
+  CATALOG_MAX_PACKAGES: ${CATALOG_MAX_PACKAGES:-25000}
+  CATALOG_NPM_DISCOVER: ${CATALOG_NPM_DISCOVER:-12000}
+  CATALOG_PYPI_DISCOVER: ${CATALOG_PYPI_DISCOVER:-8000}
+  CATALOG_MIN_ASSETS: ${CATALOG_MIN_ASSETS:-15000}
+
+x-flink-properties: &flink-properties |
+  jobmanager.rpc.address: flink-jobmanager
+  jobmanager.memory.process.size: 768m
+  taskmanager.memory.process.size: 1536m
+  taskmanager.numberOfTaskSlots: 4
+  parallelism.default: 2
+  state.backend.type: rocksdb
+  state.backend.incremental: true
+  state.checkpoints.dir: s3://checkpoints/flink
+  # keep checkpoints when a job is cancelled, so ./tracewell.sh submit-flink can resume from the latest one
+  execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+  s3.endpoint: http://seaweedfs:8333
+  s3.path.style.access: true
+  s3.access-key: ${S3_ACCESS_KEY}
+  s3.secret-key: ${S3_SECRET_KEY}
+
+services:
+  # ───────────────────────────── core ─────────────────────────────
+  redpanda:
+    image: redpandadata/redpanda:v25.3.18
+    profiles: [core]
+    command:
+      - redpanda
+      - start
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --schema-registry-addr=internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr=redpanda:33145
+      - --advertise-rpc-addr=redpanda:33145
+      - --mode=dev-container
+      - --smp=1
+      - --memory=512M
+      - --default-log-level=warn
+    ports:
+      - "19092:19092"
+      - "18081:18081"
+      - "9644:9644"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    mem_limit: 900m
+    restart: unless-stopped
+
+  redpanda-console:
+    image: redpandadata/console:v3.12.0
+    profiles: [core]
+    environment:
+      CONFIG_FILEPATH: /etc/console/config.yml
+    volumes:
+      - ./infra/redpanda-console/config.yml:/etc/console/config.yml:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    mem_limit: 200m
+    restart: unless-stopped
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.47
+    profiles: [core]
+    # S3 credentials are rendered from .env at start-up so they never live in the repo.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mkdir -p /etc/seaweedfs
+        cat > /etc/seaweedfs/s3.json <<EOF
+        {"identities":[{"name":"tracewell","credentials":[{"accessKey":"$${S3_ACCESS_KEY}","secretKey":"$${S3_SECRET_KEY}"}],"actions":["Admin","Read","Write","List","Tagging"]}]}
+        EOF
+        exec weed server -dir=/data -ip=seaweedfs -ip.bind=0.0.0.0 -volume.max=0 -master.volumeSizeLimitMB=512 -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+    ports:
+      - "8333:8333"   # S3 API
+      - "8888:8888"   # filer UI (browse buckets)
+    volumes:
+      - seaweedfs-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9333/cluster/status || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    # 400m was OOM-killed under Flink checkpoints + Iceberg commits + Spark; 1g sat at ~90% with the stream job running
+    mem_limit: 1536m
+    restart: unless-stopped
+
+  # One-shot: create the buckets Iceberg and Flink checkpoints need.
+  s3-init:
+    image: amazon/aws-cli:2.38.4
+    profiles: [core]
+    environment: *s3-env
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        for b in warehouse checkpoints; do
+          for i in $$(seq 1 30); do
+            if aws --endpoint-url http://seaweedfs:8333 s3api head-bucket --bucket $$b 2>/dev/null; then echo "bucket $$b exists"; break; fi
+            if aws --endpoint-url http://seaweedfs:8333 s3 mb s3://$$b 2>/dev/null; then echo "bucket $$b created"; break; fi
+            sleep 2
+          done
+        done
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    restart: "no"
+
+  # One-shot: the Iceberg catalog's own database and role in Postgres (idempotent).
+  catalog-db-init:
+    image: postgres:16.15-alpine
+    profiles: [core]
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      ICEBERG_DB_PASSWORD: ${ICEBERG_DB_PASSWORD}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        psql -h postgres -U airflow -d airflow -v ON_ERROR_STOP=1 -v pw="$$ICEBERG_DB_PASSWORD" <<'SQL'
+        SELECT 'CREATE ROLE iceberg LOGIN' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'iceberg') \gexec
+        ALTER ROLE iceberg WITH LOGIN PASSWORD :'pw';
+        SELECT 'CREATE DATABASE iceberg_catalog OWNER iceberg' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'iceberg_catalog') \gexec
+        SQL
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  iceberg-rest:
+    build: ./infra/iceberg-rest
+    image: tracewell/iceberg-rest:1.10.1
+    profiles: [core]
+    environment:
+      <<: *s3-env
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://seaweedfs:8333
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      # Table pointers live in Postgres: safe for concurrent commits from Flink, Spark and Trino.
+      CATALOG_URI: jdbc:postgresql://postgres:5432/iceberg_catalog
+      CATALOG_JDBC_USER: iceberg
+      CATALOG_JDBC_PASSWORD: ${ICEBERG_DB_PASSWORD}
+    ports:
+      - "8181:8181"
+    depends_on:
+      s3-init:
+        condition: service_completed_successfully
+      catalog-db-init:
+        condition: service_completed_successfully
+    mem_limit: 400m
+    restart: unless-stopped
+
+  flink-jobmanager:
+    build: ./infra/flink
+    image: tracewell/flink:1.20.3
+    profiles: [core]
+    hostname: flink-jobmanager
+    command: jobmanager
+    environment:
+      <<: *s3-env
+      FLINK_PROPERTIES: *flink-properties
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./flink-jobs:/opt/tracewell/flink-jobs
+    depends_on:
+      - iceberg-rest
+    mem_limit: 900m
+    restart: unless-stopped
+
+  flink-taskmanager:
+    image: tracewell/flink:1.20.3
+    profiles: [core]
+    command: taskmanager
+    environment:
+      <<: *s3-env
+      FLINK_PROPERTIES: *flink-properties
+    volumes:
+      - ./flink-jobs:/opt/tracewell/flink-jobs
+    depends_on:
+      - flink-jobmanager
+    mem_limit: 1800m
+    restart: unless-stopped
+
+  # ───────────────────────────── stream ─────────────────────────────
+  simulator:
+    build: ./simulator
+    image: tracewell/simulator:0.1
+    profiles: [stream]
+    environment:
+      KAFKA_BOOTSTRAP: redpanda:9092
+      SCHEMA_REGISTRY_URL: http://redpanda:8081
+    volumes:
+      - ./simulator:/opt/tracewell/simulator
+      - ./schemas:/opt/tracewell/schemas:ro
+      - ./policies:/opt/tracewell/policies:ro
+    mem_limit: 512m
+
+  # ───────────────────────────── batch ─────────────────────────────
+  spark-master:
+    build: ./infra/spark
+    image: tracewell/spark:3.5.8
+    profiles: [batch]
+    hostname: spark-master
+    command: ["spark-class", "org.apache.spark.deploy.master.Master", "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
+    environment:
+      <<: [*s3-env, *catalog-env]
+    ports:
+      - "8082:8080"   # Spark master UI
+      - "7077:7077"
+    volumes:
+      - ./spark-jobs:/opt/tracewell/spark-jobs
+      - ./tests:/opt/tracewell/tests
+      - ./schemas:/opt/tracewell/schemas:ro
+      - ./infra/spark/spark-defaults.conf:/opt/spark-conf/spark-defaults.conf:ro
+      - ./infra/spark/log4j2.properties:/opt/spark-conf/log4j2.properties:ro
+    mem_limit: 900m
+    restart: unless-stopped
+
+  spark-worker:
+    image: tracewell/spark:3.5.8
+    profiles: [batch]
+    hostname: spark-worker
+    command: ["spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077", "--cores", "2", "--memory", "1400m", "--webui-port", "8081"]
+    environment:
+      <<: *s3-env
+    ports:
+      - "8083:8081"   # Spark worker UI
+    volumes:
+      - ./spark-jobs:/opt/tracewell/spark-jobs
+      - ./schemas:/opt/tracewell/schemas:ro
+      - ./infra/spark/spark-defaults.conf:/opt/spark-conf/spark-defaults.conf:ro
+      - ./infra/spark/log4j2.properties:/opt/spark-conf/log4j2.properties:ro
+    depends_on:
+      - spark-master
+    mem_limit: 1800m
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16.15-alpine
+    profiles: [core, batch]   # core: Iceberg catalog database; batch: Airflow metadata
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    mem_limit: 256m
+    restart: unless-stopped
+
+  airflow:
+    build: ./infra/airflow
+    image: tracewell/airflow:3.3.2
+    profiles: [batch]
+    hostname: airflow   # Spark executors connect back to the driver by this name
+    command: standalone
+    environment:
+      <<: [*s3-env, *catalog-env]
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${POSTGRES_PASSWORD}@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "True"
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "True"   # local dev only: no login screen
+      AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+      AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark://spark-master", "port": 7077, "extra": {"deploy-mode": "client"}}'
+    ports:
+      - "8088:8080"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./spark-jobs:/opt/tracewell/spark-jobs
+      - ./schemas:/opt/tracewell/schemas:ro
+      - ./infra/spark/spark-defaults.conf:/opt/spark-conf/spark-defaults.conf:ro
+      - ./infra/spark/log4j2.properties:/opt/spark-conf/log4j2.properties:ro
+      - ./policies:/opt/tracewell/policies:ro          # rule names for gold.policy_hits
+      - ./flink-jobs:/opt/tracewell/flink-jobs:ro      # job jar for flink_job_health auto-resubmit
+      - airflow-logs:/opt/airflow/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+    mem_limit: 3g
+    restart: unless-stopped
+
+  # ───────────────────────────── bi ─────────────────────────────
+  trino:
+    image: trinodb/trino:483
+    profiles: [bi]
+    environment:
+      <<: *s3-env
+    ports:
+      - "8085:8080"
+    volumes:
+      - ./infra/trino/catalog:/etc/trino/catalog:ro
+      - ./infra/trino/jvm.config:/etc/trino/jvm.config:ro
+    mem_limit: 1400m
+    restart: unless-stopped
+
+  superset:
+    build: ./infra/superset
+    image: tracewell/superset:6.1.0
+    profiles: [bi]
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD}
+    command: ["/bin/bash", "/app/docker/tracewell-init.sh"]
+    ports:
+      - "8089:8088"
+    volumes:
+      - ./infra/superset/tracewell-init.sh:/app/docker/tracewell-init.sh:ro
+      - superset-home:/app/superset_home
+    mem_limit: 1g
+    restart: unless-stopped
+
+volumes:
+  redpanda-data:
+  seaweedfs-data:
+  iceberg-catalog:          # old SQLite catalog, kept as a backup after the move to Postgres
+  postgres-data:
+  airflow-logs:
+  superset-home:
