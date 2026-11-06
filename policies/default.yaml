@@ -1,0 +1,67 @@
+# Policy rules evaluated by Flink for every event, in priority order; the first match wins, default = allow.
+# Published to the compacted topic `policy-updates` (./tracewell.sh policies) and held in Flink broadcast state,
+# so edits apply within seconds without redeploying the job.
+#
+# Conditions (all given conditions must hold):
+#   sensitive_types_any: [PCI, PII, SECRET, GOV_ID]   event text contains one of these
+#   asset_sanctioned: true|false                      asset is / is not on the company allow-list
+#   asset_band_in: [Low, Medium, High, Critical]      risk band of the asset at event time
+#   asset_known: true|false                           asset found in the risk catalog
+#   event_type_in: [...]                              e.g. prompt, file_upload, mcp_tool_call
+#   tool_name_in: [...]                               MCP tool names
+#   file_ext_in: [...]                                extension of file_name, e.g. xlsx, csv
+
+- policy_id: P001
+  name: Block payment data to unsanctioned AI
+  priority: 10
+  when:
+    sensitive_types_any: [PCI]
+    asset_sanctioned: false
+  action: block
+
+- policy_id: P002
+  name: Block critical-risk assets
+  priority: 20
+  when:
+    asset_band_in: [Critical]
+  action: block
+
+- policy_id: P003
+  name: Block secrets sent to unsanctioned AI
+  priority: 30
+  when:
+    sensitive_types_any: [SECRET]
+    asset_sanctioned: false
+  action: block
+
+- policy_id: P004
+  name: Warn on any sensitive data sent to AI
+  priority: 40
+  when:
+    sensitive_types_any: [PCI, PII, SECRET, GOV_ID]
+  action: warn
+
+- policy_id: P005
+  name: Warn on high-risk MCP tools touching data
+  priority: 50
+  when:
+    event_type_in: [mcp_tool_call]
+    asset_band_in: [High, Critical]
+    tool_name_in: [read_file, write_file, query, execute, run_command]
+  action: warn
+
+- policy_id: P006
+  name: Warn on spreadsheets uploaded to unsanctioned AI
+  priority: 60
+  when:
+    event_type_in: [file_upload]
+    asset_sanctioned: false
+    file_ext_in: [xlsx, csv, xls]
+  action: warn
+
+- policy_id: P007
+  name: Warn on unknown AI assets
+  priority: 70
+  when:
+    asset_known: false
+  action: warn

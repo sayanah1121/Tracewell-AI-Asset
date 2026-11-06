@@ -1,0 +1,26 @@
+{
+  "type": "record",
+  "name": "AiEvent",
+  "namespace": "ai.tracewell.stream",
+  "doc": "One AI action observed on one device by the device, browser or network sensor. Key = device_id.",
+  "fields": [
+    {"name": "event_id",        "type": "string", "doc": "UUID; idempotency key (devices may resend)"},
+    {"name": "ts_event",        "type": {"type": "long", "logicalType": "timestamp-millis"}, "doc": "event time on the device"},
+    {"name": "ts_sent",         "type": {"type": "long", "logicalType": "timestamp-millis"}, "doc": "send time; later than ts_event when the device was offline"},
+    {"name": "device_id",       "type": "string"},
+    {"name": "os",              "type": "string"},
+    {"name": "identity",        "type": "string"},
+    {"name": "department",      "type": "string"},
+    {"name": "sensor",          "type": "string", "doc": "device | browser | network"},
+    {"name": "event_type",      "type": "string", "doc": "asset_discovered | prompt | file_upload | paste | mcp_tool_call | model_inference | egress"},
+    {"name": "asset_ref",       "type": "string", "doc": "raw reference as seen by the sensor; resolved to asset_id in Flink"},
+    {"name": "asset_version",   "type": ["null", "string"], "default": null},
+    {"name": "tool_name",       "type": ["null", "string"], "default": null},
+    {"name": "prompt_text",     "type": ["null", "string"], "default": null, "doc": "RAW text: redacted in Flink before any sink"},
+    {"name": "file_name",       "type": ["null", "string"], "default": null},
+    {"name": "file_size_bytes", "type": ["null", "long"],   "default": null},
+    {"name": "dest_host",       "type": ["null", "string"], "default": null},
+    {"name": "bytes_out",       "type": ["null", "long"],   "default": null},
+    {"name": "schema_version",  "type": "int", "default": 1}
+  ]
+}
