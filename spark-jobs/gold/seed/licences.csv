@@ -1,0 +1,13 @@
+tool_id,tool_name,function,department,seats,cost_per_seat_month
+service:chatgpt,ChatGPT Enterprise,chat_assistant,engineering,15,60
+service:chatgpt,ChatGPT Enterprise,chat_assistant,finance,10,60
+service:chatgpt,ChatGPT Enterprise,chat_assistant,sales,22,60
+service:chatgpt,ChatGPT Enterprise,chat_assistant,hr,10,60
+service:chatgpt,ChatGPT Enterprise,chat_assistant,support,40,60
+service:chatgpt,ChatGPT Enterprise,chat_assistant,legal,12,60
+service:microsoft-365-copilot,Microsoft 365 Copilot,chat_assistant,finance,38,30
+service:microsoft-365-copilot,Microsoft 365 Copilot,chat_assistant,sales,54,30
+service:microsoft-365-copilot,Microsoft 365 Copilot,chat_assistant,hr,21,30
+service:microsoft-365-copilot,Microsoft 365 Copilot,chat_assistant,legal,30,30
+agent:github-copilot,GitHub Copilot Business,coding_assistant,engineering,20,19
+agent:cursor,Cursor Business,coding_assistant,engineering,20,40
