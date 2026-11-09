@@ -1,0 +1,4 @@
+# CI test dependencies; same versions as infra/spark/Dockerfile
+pyspark==3.5.8
+pytest==8.4.2
+ruff==0.13.3

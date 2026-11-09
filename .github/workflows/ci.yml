@@ -1,0 +1,55 @@
+name: ci
+
+# Unit tests and builds on every push and pull request. The full stack (Redpanda, Flink, Iceberg, Airflow)
+# is exercised locally with ./tracewell.sh demo-crash / demo-tamper / demo-schema, not in CI.
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    name: lint + pytest (Spark local mode)
+    runs-on: ubuntu-latest
+    env:
+      TZ: UTC
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4          # PySpark needs a JVM
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: .github/requirements-ci.txt
+      - name: Install (same versions as infra/spark/Dockerfile)
+        run: pip install -r .github/requirements-ci.txt
+      - name: Lint (pyflakes rules)
+        run: ruff check --select F --target-version py311 spark-jobs simulator airflow dashboards tests
+      - name: Unit tests
+        run: python -m pytest -q -p no:cacheprovider tests
+
+  flink:
+    name: Flink job (build + JUnit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+      - name: Build and test
+        working-directory: flink-jobs/tracewell-stream
+        run: mvn -B -q package
+
+  stack:
+    name: compose file + helper script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker compose config
+        run: cp .env.example .env && docker compose --profile core --profile batch --profile bi --profile stream config -q
+      - name: tracewell.sh syntax
+        run: bash -n tracewell.sh
